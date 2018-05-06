@@ -506,6 +506,12 @@ config QPNP_SMBCHARGER
 	  The driver also offers relevant information to userspace via the
 	  power supply framework.
 
+config CONFIG_SMART_CHARGING_CONTROL
+	tristate "TINNO Smart Charging interface"
+	depends on QPNP_SMBCHARGER
+	help
+	 Say Y here to enable support for Tinno's fast charging.
+
 config FUELGAUGE_STC3117
 	tristate "STC3117 fuel gauge driver"
 	default n
@@ -525,6 +531,13 @@ config QPNP_FG
 	  battery fuel gauging and state of charge of battery connected to the
 	  fuel gauge. The state of charge is reported through a BMS power
 	  supply property and also sends uevents when the capacity is updated.
+
+config TINNO_BATTERY_FG_HEART
+	tristate "TINNO battery FG heart config for debug"
+	depends on QPNP_FG
+	help
+	 Say Y here to enable support for tinno battery heart update for charger debug
+	 PMIC chips.
 
 config BATTERY_BCL
 	tristate "Battery Current Limit driver"

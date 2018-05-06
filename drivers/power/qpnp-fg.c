@@ -638,6 +638,12 @@ struct fg_chip {
 	bool			batt_info_restore;
 	bool			*batt_range_ocv;
 	int			*batt_range_pct;
+#ifdef CONFIG_TINNO_BATTERY_FG_HEART
+	struct delayed_work  update_heartbeat_work;
+	bool                 resume_completed;
+	bool                 update_heartbeat_waiting;
+	struct mutex         r_completed_lock;
+#endif
 };
 
 /* FG_MEMIF DEBUGFS structures */
@@ -7406,6 +7412,9 @@ static int fg_remove(struct spmi_device *spmi)
 {
 	struct fg_chip *chip = dev_get_drvdata(&spmi->dev);
 
+#ifdef CONFIG_TINNO_BATTERY_FG_HEART
+	mutex_destroy(&chip->r_completed_lock);
+#endif
 	fg_cleanup(chip);
 	dev_set_drvdata(&spmi->dev, NULL);
 	return 0;
@@ -8558,6 +8567,48 @@ done:
 	fg_cleanup(chip);
 }
 
+#ifdef CONFIG_TINNO_BATTERY_FG_HEART
+#define UPDATE_HEART_PERIOD_FAST_MS      61000
+#define UPDATE_HEART_PERIOD_NORMAL_MS      21000 
+#define BATT_CAPA_LOW_LEVEL      15
+static void qpnp_fg_update_heartbeat_work(struct work_struct *work)
+{
+	struct delayed_work *dwork = to_delayed_work(work);
+	struct fg_chip *chip = container_of(dwork,
+				struct fg_chip, update_heartbeat_work);
+		
+	int soc = 0,temp = 0, bat_vol = 0, bat_current= 0, input_present = 0;
+	int update_period = UPDATE_HEART_PERIOD_NORMAL_MS;
+	
+	mutex_lock(&chip->r_completed_lock);
+	chip->update_heartbeat_waiting = true;
+	if (!chip->resume_completed) {
+		pr_info("qpnp_fg_update_heartbeat_work before device-resume\n");
+		mutex_unlock(&chip->r_completed_lock);
+		return ;
+	}
+	
+	chip->update_heartbeat_waiting = false;
+	mutex_unlock(&chip->r_completed_lock);
+
+	soc = get_prop_capacity(chip);		
+	temp = get_sram_prop_now(chip, FG_DATA_BATT_TEMP);
+	bat_vol = get_sram_prop_now(chip, FG_DATA_VOLTAGE);
+	bat_current = get_sram_prop_now(chip, FG_DATA_CURRENT);
+	input_present = is_input_present(chip);
+
+	if(BATT_CAPA_LOW_LEVEL >= soc){
+		update_period = UPDATE_HEART_PERIOD_NORMAL_MS;
+	}
+
+	schedule_delayed_work(
+		&chip->update_heartbeat_work,
+		msecs_to_jiffies(update_period));
+		
+	return;
+}
+#endif
+
 static int fg_probe(struct spmi_device *spmi)
 {
 	struct device *dev = &(spmi->dev);
@@ -8645,6 +8696,14 @@ static int fg_probe(struct spmi_device *spmi)
 	INIT_WORK(&chip->slope_limiter_work, slope_limiter_work);
 	INIT_WORK(&chip->dischg_gain_work, discharge_gain_work);
 	INIT_WORK(&chip->cc_soc_store_work, cc_soc_store_work);
+
+#ifdef CONFIG_TINNO_BATTERY_FG_HEART
+	chip->resume_completed = true;
+	chip->update_heartbeat_waiting = false;
+	mutex_init(&chip->r_completed_lock);
+	INIT_DELAYED_WORK(&chip->update_heartbeat_work, qpnp_fg_update_heartbeat_work);
+#endif
+
 	alarm_init(&chip->fg_cap_learning_alarm, ALARM_BOOTTIME,
 			fg_cap_learning_alarm_cb);
 	alarm_init(&chip->hard_jeita_alarm, ALARM_BOOTTIME,
@@ -8801,6 +8860,12 @@ static int fg_probe(struct spmi_device *spmi)
 		chip->revision[ANA_MAJOR], chip->revision[ANA_MINOR],
 		chip->pmic_subtype);
 
+#ifdef CONFIG_TINNO_BATTERY_FG_HEART
+	schedule_delayed_work(
+		&chip->update_heartbeat_work,
+		msecs_to_jiffies(20000));
+#endif
+
 	return rc;
 
 power_supply_unregister:
@@ -8814,6 +8879,9 @@ of_init_fail:
 	mutex_destroy(&chip->learning_data.learning_lock);
 	mutex_destroy(&chip->sysfs_restart_lock);
 	mutex_destroy(&chip->ima_recovery_lock);
+#ifdef CONFIG_TINNO_BATTERY_FG_HEART
+	mutex_destroy(&chip->r_completed_lock);
+#endif
 	wakeup_source_trash(&chip->resume_soc_wakeup_source.source);
 	wakeup_source_trash(&chip->empty_check_wakeup_source.source);
 	wakeup_source_trash(&chip->memif_wakeup_source.source);
@@ -8860,12 +8928,33 @@ static void check_and_update_sram_data(struct fg_chip *chip)
 		&chip->update_sram_data, msecs_to_jiffies(time_left * 1000));
 }
 
+#ifdef CONFIG_TINNO_BATTERY_FG_HEART
+static int fg_suspend_noirq(struct device *dev)
+{
+	int rc = 0;
+	struct fg_chip *chip = dev_get_drvdata(dev);
+	
+	if (chip->update_heartbeat_waiting) {
+		pr_err_ratelimited("Aborting suspend, an update_heartbeat_waiting while suspending\n");
+		return -EBUSY;
+	}
+	return rc;
+}
+#endif
+
 static int fg_suspend(struct device *dev)
 {
 	struct fg_chip *chip = dev_get_drvdata(dev);
 
 	if (!chip->sw_rbias_ctrl)
 		return 0;
+
+#ifdef CONFIG_TINNO_BATTERY_FG_HEART
+	mutex_lock(&chip->r_completed_lock);
+	chip->resume_completed = false;
+	mutex_unlock(&chip->r_completed_lock);
+	cancel_delayed_work_sync(&chip->update_heartbeat_work);
+#endif
 
 	cancel_delayed_work(&chip->update_temp_work);
 	cancel_delayed_work(&chip->update_sram_data);
@@ -8876,9 +8965,27 @@ static int fg_suspend(struct device *dev)
 static int fg_resume(struct device *dev)
 {
 	struct fg_chip *chip = dev_get_drvdata(dev);
-
+#ifdef CONFIG_TINNO_BATTERY_FG_HEART
+	bool update_heartbeat_again = false;
+	
 	if (!chip->sw_rbias_ctrl)
 		return 0;
+
+	mutex_lock(&chip->r_completed_lock);
+	chip->resume_completed = true;
+	if (chip->update_heartbeat_waiting) {
+		update_heartbeat_again = true;
+	}
+	mutex_unlock(&chip->r_completed_lock);
+	
+	if (update_heartbeat_again) {
+		cancel_delayed_work_sync(&chip->update_heartbeat_work);
+		qpnp_fg_update_heartbeat_work(&chip->update_heartbeat_work.work);
+	}
+#else
+	if (!chip->sw_rbias_ctrl)
+		return 0;
+#endif
 
 	check_and_update_sram_data(chip);
 	return 0;
@@ -8927,6 +9034,9 @@ static void fg_shutdown(struct spmi_device *spmi)
 
 static const struct dev_pm_ops qpnp_fg_pm_ops = {
 	.suspend	= fg_suspend,
+#ifdef CONFIG_TINNO_BATTERY_FG_HEART
+	.suspend_noirq = fg_suspend_noirq,	
+#endif
 	.resume		= fg_resume,
 };
 
